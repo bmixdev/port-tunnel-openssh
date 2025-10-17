@@ -1,20 +1,32 @@
 // (c) Universal OpenSSH Port Forwarder for Windows — pure Java SE
 // ============================================================================================
-// ЭТОТ ФАЙЛ — полнофункциональная консольная утилита проброса портов через OpenSSH (ssh.exe).
-// Ключевые особенности:
-//  • Читает JSON-конфиг (без внешних зависимостей — встроенный простой парсер/писатель JSON).
+// НОВОЕ: автоматическое добавление ключей хоста в known_hosts.
+//  • Сначала пробуем ssh-keyscan (если доступен) и бесшумно дописываем ключи.
+//  • Если ssh-keyscan недоступен/неудачен — выполняем "preflight" коннект с
+//    StrictHostKeyChecking=accept-new и BatchMode=no (передаём управление пользователю для подтверждения).
+//
+// Остальные возможности:
+//  • Читает JSON-конфиг (без внешних зависимостей — встроенный парсер/писатель JSON).
 //  • Опционально генерирует SSH-ключ (ssh-keygen.exe) и добавляет его в ssh-agent (ssh-add.exe).
 //  • Поддерживает ProxyJump (бастион) — одиночный или цепочку хопов.
 //  • Поднимает несколько локальных форвардов (-L) за один ssh-процесс.
 //  • Автоперезапуск (retry) с экспоненциальным бэкоффом.
-//  • Печатает в stdout JSON c ФАКТИЧЕСКИ выделенными локальными портами (когда localPort=0).
+//  • Печатает в stdout JSON с фактическими выделенными локальными портами (когда localPort=0).
 //
-// БЫСТРЫЙ СТАРТ (из корня репозитория):
-//   javac src/main/java/PortTunnelOpenSSH.java
-//   jar --create --file port-tunnel-oss-win.jar --main-class=PortTunnelOpenSSH -C src/main/java PortTunnelOpenSSH.class
+// Быстрый старт (из корня проекта):
+//   javac -d out src/main/java/PortTunnelOpenSSH.java
+//   (создайте manifest.mf с Main-Class: PortTunnelOpenSSH и пустой строкой в конце)
+//   jar cfm port-tunnel-oss-win.jar manifest.mf -C out .
 //   java -jar port-tunnel-oss-win.jar config.json
 //
-// СМ. README.md и config.example.json для подробностей.
+// Ключевые новые поля конфига (необязательные):
+//   "sshKeyscanPath": "C:\\Windows\\System32\\OpenSSH\\ssh-keyscan.exe", // по умолчанию: "ssh-keyscan"
+//   "userKnownHostsFile": "%USERPROFILE%\\.ssh\\known_hosts"              // можно оставить null → будет user.home\.ssh\known_hosts
+//
+// Поведение:
+//   - Если strictHostKeyChecking=true и в known_hosts нет записей для целевого/бастионов,
+//     код попробует ssh-keyscan; если не выйдет — выполнит preflight-коннект, где пользователь
+//     сможет подтвердить отпечатки (или пройти пароль/MFA).
 // ============================================================================================
 
 import java.io.*;
@@ -26,9 +38,6 @@ import java.util.*;
 
 public class PortTunnelOpenSSH {
 
-    // ----------------------------------------------------------------------------------------
-    // Точка входа. Принимает единственный аргумент — путь к JSON‑конфигу.
-    // ----------------------------------------------------------------------------------------
     public static void main(String[] args) {
         if (args.length < 1) {
             System.err.println("Usage: java -jar port-tunnel-oss-win.jar <config.json>");
@@ -52,25 +61,23 @@ public class PortTunnelOpenSSH {
         this.log = new Logger(optStr(cfg,"logLevel","info"));
     }
 
-    // ----------------------------------------------------------------------------------------
-    // Основной рабочий цикл: чтение конфига → (опционально) генерация ключа → запуск ssh
-    // с временным конфигом → ожидание поднятия локальных портов → вывод JSON c портами →
-    // удержание процесса и, при необходимости, автоперезапуск.
-    // ----------------------------------------------------------------------------------------
     private void run() throws Exception {
         // --- Обязательные параметры удалённого SSH-хоста ---
         String sshHost = reqStr(cfg,"sshHost");
         int sshPort = optInt(cfg,"sshPort",22);
         String sshUser = reqStr(cfg,"sshUser");
 
-        // --- Пути к исполняемым OpenSSH (можно просто "ssh"/"ssh-keygen"/"ssh-add", если в PATH) ---
-        String sshPath = optStr(cfg,"opensshPath","ssh");
+        // --- Пути к утилитам OpenSSH (можно оставить просто имена, если в PATH) ---
+        String sshPath       = optStr(cfg,"opensshPath","ssh");
         String sshKeygenPath = optStr(cfg,"sshKeygenPath","ssh-keygen");
-        String sshAddPath = optStr(cfg,"sshAddPath","ssh-add");
+        String sshAddPath    = optStr(cfg,"sshAddPath","ssh-add");
+        String sshKeyscanPath= optStr(cfg,"sshKeyscanPath","ssh-keyscan"); // НОВОЕ: для предварительного получения ключей
 
         // --- Поведение SSH ---
         boolean strict = optBool(cfg,"strictHostKeyChecking", true);   // строго проверять known_hosts?
-        String knownHosts = optStr(cfg,"userKnownHostsFile", null);    // альтернативный файл known_hosts
+        String knownHosts = optStr(cfg,"userKnownHostsFile", null);    // альтернативный known_hosts (можно с %VAR% и ~)
+        knownHosts = defaultKnownHosts(expandPath(knownHosts));        // если null → %USERPROFILE%\.ssh\known_hosts
+
         int keepaliveSec = optInt(cfg,"keepaliveSec", 60);             // ServerAliveInterval
 
         // --- ProxyJump (бастион) — можно выключить блоком { "enabled": false } ---
@@ -80,7 +87,7 @@ public class PortTunnelOpenSSH {
         // --- Блок генерации ключа (необязательный) ---
         Map<String,Object> keygen = optObj(cfg,"keygen", Map.of());
         boolean keygenEnabled = optBool(keygen,"enabled", false);
-        String identityFile = optStr(keygen,"identityFile", null);
+        String identityFile = expandPath(optStr(keygen,"identityFile", null));
         if (keygenEnabled) {
             if (identityFile == null || identityFile.isBlank())
                 throw new IllegalArgumentException("keygen.identityFile is required when keygen.enabled=true");
@@ -94,14 +101,14 @@ public class PortTunnelOpenSSH {
             throw new IllegalArgumentException("OpenSSH mode uses key auth only. Set auth.method=\"key\".");
         }
 
-        // --- Список форвардов (можно несколько). localPort=0 → выбрать свободный порт автоматически. ---
+        // --- Список форвардов ---
         List<Map<String,Object>> fwArr = reqArr(cfg,"forwards");
         List<Forward> forwards = new ArrayList<>();
         for (Map<String,Object> m : fwArr) {
-            String lba = reqStr(m,"localBindAddr");         // адрес привязки локального сокета (обычно 127.0.0.1)
-            int lp = optInt(m,"localPort",0);               // 0 → авто-порт
-            String rh = reqStr(m,"remoteHost");             // удалённый хост (относительно целевого SSH-сервера)
-            int rp = optInt(m,"remotePort",-1);             // порт удалённого сервиса
+            String lba = reqStr(m,"localBindAddr");
+            int lp = optInt(m,"localPort",0);
+            String rh = reqStr(m,"remoteHost");
+            int rp = optInt(m,"remotePort",-1);
             if (rp <= 0) throw new IllegalArgumentException("remotePort must be > 0");
             if (lp == 0) lp = findFreePort(lba);
             forwards.add(new Forward(lba, lp, rh, rp));
@@ -110,6 +117,11 @@ public class PortTunnelOpenSSH {
         // --- Если ключ только что генерили — добавим его в агент (упрощает работу с passphrase) ---
         if (keygenEnabled && optBool(keygen,"addToAgent", true)) {
             tryAddToAgent(sshAddPath, identityFile, log);
+        }
+
+        // --- НОВОЕ: Обеспечиваем наличие ключей хоста в known_hosts, если strict=true ---
+        if (strict) {
+            ensureHostKeys(sshPath, sshKeyscanPath, knownHosts, sshUser, sshHost, sshPort, proxy);
         }
 
         // --- Настройки вывода фактических портов ---
@@ -123,27 +135,25 @@ public class PortTunnelOpenSSH {
         // --- Runner: создаёт временный ssh_config, запускает ssh.exe, ждёт подъёма портов ---
         OpenSshRunner runner = new OpenSshRunner(
                 sshPath, sshHost, sshPort, sshUser,
-                identityFile, strict, knownHosts, keepaliveSec,
+                identityFile, true /*strict всегда true на основном этапе*/,
+                knownHosts, keepaliveSec,
                 proxy, forwards, log,
                 printJson, jsonPath
         );
 
-        // Короткая печать того, что будем поднимать
         log.info("Local forwards (план):");
         for (Forward f : forwards) log.info("  " + f);
 
-        // Корректное завершение по Ctrl+C
         Runtime.getRuntime().addShutdownHook(new Thread(runner::stop, "tunnel-stop"));
 
-        // Главный цикл: старт → ожидание → (emit JSON) → удержание → при падении — retry
         long delay = retry.initialDelayMs;
         while (true) {
             try {
                 runner.start();
-                runner.waitUp(Duration.ofSeconds(12));  // дожидаемся, когда локальные порты реально слушают
-                runner.emitJsonOnce();                  // печатаем/сохраняем JSON с ФАКТИЧЕСКИМИ портами
+                runner.waitUp(Duration.ofSeconds(12));
+                runner.emitJsonOnce();
                 log.info("Tunnel is up. Press Ctrl+C to stop.");
-                runner.waitForExit();                   // блокируемся, пока ssh.exe жив
+                runner.waitForExit();
                 log.error("ssh process exited.");
             } catch (Exception e) {
                 log.error("Tunnel error: " + e.getMessage());
@@ -157,12 +167,215 @@ public class PortTunnelOpenSSH {
     }
 
     // =========================================================================================
-    // ProxyJump: представление и генерация строк ssh_config для 'ProxyJump ...'
+    // НОВОЕ: Автоматическое добавление ключей хоста в known_hosts
+    // =========================================================================================
+
+    /**
+     * Гарантирует, что ключи целевого хоста (и ProxyJump-хостов) присутствуют в known_hosts.
+     * Стратегия:
+     *  1) Проверяем записи по списку хостов (имя + [host]:port).
+     *  2) Если чего-то нет — пробуем ssh-keyscan и дописываем.
+     *  3) Если ssh-keyscan недоступен/неудачен — выполняем preflight-коннект
+     *     с StrictHostKeyChecking=accept-new и BatchMode=no (передача управления пользователю).
+     */
+    private void ensureHostKeys(String sshPath,
+                                String sshKeyscanPath,
+                                String knownHosts,
+                                String sshUser,
+                                String targetHost,
+                                int targetPort,
+                                ProxyJump proxy) throws Exception {
+
+        // Список всех хостов, через которые пройдёт соединение
+        List<HostPort> hosts = new ArrayList<>();
+        hosts.add(new HostPort(targetHost, targetPort));
+        hosts.addAll(proxy.hosts());
+
+        // Создаём директорию known_hosts при необходимости
+        Path khPath = Paths.get(knownHosts);
+        Path khParent = khPath.getParent();
+        if (khParent != null) {
+            try {
+                Files.createDirectories(khParent);
+            } catch (FileAlreadyExistsException fae) {
+                if (!Files.isDirectory(khParent))
+                    throw new IOException("Parent exists but is not a directory: " + khParent);
+            }
+        }
+        if (!Files.exists(khPath)) Files.createFile(khPath);
+
+        // Проверяем, какие хосты отсутствуют
+        List<HostPort> missing = new ArrayList<>();
+        String khContent = Files.readString(khPath, StandardCharsets.UTF_8);
+        for (HostPort hp : hosts) {
+            if (!isHostListed(khContent, hp)) {
+                missing.add(hp);
+            }
+        }
+        if (missing.isEmpty()) {
+            log.info("known_hosts уже содержит все нужные записи.");
+            return;
+        }
+
+        log.info("Не найдены отпечатки для: " + missing);
+
+        // 1) Пробуем ssh-keyscan (если доступен)
+        boolean allDone = true;
+        for (HostPort hp : new ArrayList<>(missing)) {
+            if (tryKeyscanAppend(sshKeyscanPath, khPath, hp)) {
+                missing.remove(hp);
+            } else {
+                allDone = false;
+            }
+        }
+        if (allDone) {
+            log.info("Ключи получены через ssh-keyscan и добавлены в known_hosts.");
+            return;
+        }
+
+        // 2) Preflight-коннект (accept-new): строим временный ssh_config и выполняем "ssh target exit"
+        // Это добавит записи для всех хостов на маршруте (включая ProxyJump), запросив подтверждение у пользователя.
+        log.info("Пробуем preflight-коннект с StrictHostKeyChecking=accept-new (может потребоваться вмешательство пользователя)...");
+        preflightAcceptNew(sshPath, sshUser, targetHost, targetPort, proxy, knownHosts);
+
+        // Проверим повторно
+        khContent = Files.readString(khPath, StandardCharsets.UTF_8);
+        missing.clear();
+        for (HostPort hp : hosts) {
+            if (!isHostListed(khContent, hp)) {
+                missing.add(hp);
+            }
+        }
+        if (missing.isEmpty()) {
+            log.info("Ключи успешно добавлены в known_hosts после preflight.");
+        } else {
+            log.error("Не удалось добавить ключи для: " + missing + ". " +
+                      "Проверьте доступность ssh/ssh-keyscan и права на файл known_hosts.");
+        }
+    }
+
+    // Пробуем получить ключ через ssh-keyscan и апендить его в known_hosts.
+    private boolean tryKeyscanAppend(String sshKeyscanPath, Path knownHosts, HostPort hp) {
+        try {
+            List<String> cmd = new ArrayList<>();
+            cmd.add(sshKeyscanPath);
+            cmd.add("-p"); cmd.add(String.valueOf(hp.port));
+            cmd.add(hp.host);
+
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            String out = readAll(p.getInputStream());
+            int code = p.waitFor();
+            if (code != 0 || out.isBlank()) {
+                log.debug("ssh-keyscan failed for " + hp + " (code " + code + "). Output:\n" + out);
+                return false;
+            }
+            Files.writeString(knownHosts, out, StandardCharsets.UTF_8, StandardOpenOption.APPEND);
+            log.info("Добавлен ключ хоста (ssh-keyscan): " + hp);
+            return true;
+        } catch (IOException | InterruptedException e) {
+            log.debug("ssh-keyscan error for " + hp + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    // Preflight-коннект: создаём временный ssh_config со StrictHostKeyChecking=accept-new и BatchMode=no,
+    // затем выполняем "ssh target exit" (быстрое подключение/выход), чтобы зафиксировать ключи.
+    private void preflightAcceptNew(String sshPath,
+                                    String sshUser,
+                                    String targetHost,
+                                    int targetPort,
+                                    ProxyJump proxy,
+                                    String knownHosts) throws Exception {
+
+        Path tempDir = Files.createTempDirectory("ptw-preflight-");
+        Path sshConfig = tempDir.resolve("ssh_config");
+        try {
+            List<String> cfg = new ArrayList<>();
+            cfg.add("Host target");
+            cfg.add("  HostName " + targetHost);
+            cfg.add("  Port " + targetPort);
+            cfg.add("  User " + sshUser);
+            cfg.add("  BatchMode no");                      // разрешаем интерактив
+            cfg.add("  StrictHostKeyChecking accept-new");  // автоматически принять НОВЫЕ ключи
+            cfg.add("  UserKnownHostsFile " + escapePathForSsh(knownHosts));
+            cfg.add("  ConnectTimeout 10");
+
+            // ProxyJump (если включён)
+            cfg.addAll(proxy.toConfigLines());
+
+            Files.writeString(sshConfig, String.join(System.lineSeparator(), cfg)+System.lineSeparator(), StandardCharsets.UTF_8);
+
+            List<String> cmd = new ArrayList<>();
+            cmd.add(sshPath);
+            cmd.add("-F"); cmd.add(sshConfig.toString());
+            // Выполним короткую удалённую команду, чтобы подключение завершилось быстро
+            cmd.add("target");
+            cmd.add("exit");
+
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.inheritIO(); // ПЕРЕДАЁМ УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЮ (консоль покажет запрос подтверждения/пароль/MFA)
+            Process p = pb.start();
+            int code = p.waitFor();
+            if (code == 0) {
+                log.info("Preflight-коннект завершён успешно.");
+            } else {
+                log.error("Preflight-коннект завершился с кодом " + code + ". Возможно, требуется ручное подтверждение/доступ.");
+            }
+        } finally {
+            try (var s = Files.list(tempDir)) { s.forEach(path -> { try { Files.deleteIfExists(path);} catch (IOException ignored){} }); }
+            Files.deleteIfExists(sshConfig);
+            Files.deleteIfExists(tempDir);
+        }
+    }
+
+    // Проверяем, есть ли в known_hosts запись для хоста с учётом возможного формата "[host]:port"
+    private static boolean isHostListed(String knownHostsContent, HostPort hp) {
+        String h1 = hp.host;
+        String h2 = "[" + hp.host + "]:" + hp.port;
+        // Очень простая проверка подстроки. Для надёжности можно парсить, но для наших целей достаточно.
+        return containsHostToken(knownHostsContent, h1) || containsHostToken(knownHostsContent, h2);
+    }
+    private static boolean containsHostToken(String content, String token) {
+        // Упрощённая проверка, чтобы уменьшить риск ложного срабатывания на части других доменов
+        // Смотрим либо начало строки, либо символы-разделители перед токеном.
+        for (String line : content.split("\\R")) {
+            line = line.trim();
+            if (line.isEmpty() || line.startsWith("#")) continue;
+            if (line.equals(token)) return true;
+            if (line.startsWith(token + " ") || line.startsWith(token + ",")) return true;
+            if (line.contains("," + token + " ") || line.contains(" " + token + " ")) return true;
+            if (line.startsWith("|1|")) { /* hashed known_hosts — не распознаём; пропускаем */ }
+        }
+        return false;
+    }
+
+    private static String escapePathForSsh(String p) {
+        // Для ssh_config в Windows экранируем обратные слэши как \\ (иначе ssh может интерпретировать их как escape)
+        return p.replace("\\", "\\\\");
+    }
+
+    private static String defaultKnownHosts(String expanded) {
+        if (expanded != null && !expanded.isBlank()) return expanded;
+        String home = System.getProperty("user.home");
+        return Paths.get(home, ".ssh", "known_hosts").toString();
+    }
+
+    // Представление узла host:port
+    private static final class HostPort {
+        final String host; final int port;
+        HostPort(String h,int p){this.host=h;this.port=p;}
+        public String toString(){ return host + ":" + port; }
+    }
+
+    // =========================================================================================
+    // ProxyJump
     // =========================================================================================
     private static final class ProxyJump {
         final boolean enabled;
-        final String single;        // одиночный "user@host:port"
-        final List<String> chain;   // цепочка ["user@h1:22","user@h2:2202", ...]
+        final String single;
+        final List<String> chain;
 
         private ProxyJump(boolean en, String single, List<String> chain) {
             this.enabled=en; this.single=single; this.chain=chain;
@@ -170,10 +383,7 @@ public class PortTunnelOpenSSH {
 
         @SuppressWarnings("unchecked")
         static ProxyJump from(Map<String,Object> pj) {
-            // Если блок пустой или выключен — просто не используем ProxyJump.
             if (pj==null || pj.isEmpty() || !optBool(pj,"enabled",false)) return new ProxyJump(false,null,null);
-
-            // Если задана цепочка — собираем её; при необходимости добавляем user и порт по умолчанию 22
             List<Object> chainRaw = (List<Object>) pj.get("chain");
             if (chainRaw != null && !chainRaw.isEmpty()) {
                 String defaultUser = optStr(pj,"user", null);
@@ -186,8 +396,6 @@ public class PortTunnelOpenSSH {
                 }
                 return new ProxyJump(true, null, chain);
             }
-
-            // Иначе ожидаем одиночный бастион
             String host = optStr(pj,"host", null);
             if (host==null || host.isBlank()) throw new IllegalArgumentException("proxyJump.host required (или proxyJump.chain)");
             int port = optInt(pj,"port",22);
@@ -196,18 +404,39 @@ public class PortTunnelOpenSSH {
             return new ProxyJump(true, target, null);
         }
 
-        // Строки для ssh_config
         List<String> toConfigLines() {
             if (!enabled) return List.of();
             if (single != null) return List.of("  ProxyJump " + single);
             return List.of("  ProxyJump " + String.join(",", chain));
         }
 
-        // Удобное строковое представление для JSON-вывода
         String asString() {
             if (!enabled) return null;
             if (single != null) return single;
             return String.join(",", chain);
+        }
+
+        // Разворачиваем в список host:port для precheck (цепочку тоже)
+        List<HostPort> hosts() {
+            List<HostPort> list = new ArrayList<>();
+            if (!enabled) return list;
+            if (single != null) {
+                list.add(parseHP(single));
+            } else {
+                for (String s : chain) list.add(parseHP(s));
+            }
+            return list;
+        }
+        private HostPort parseHP(String s) {
+            // форматы: user@host:port | host:port
+            String t = s;
+            int at = t.indexOf('@');
+            if (at >= 0) t = t.substring(at+1);
+            int colon = t.lastIndexOf(':');
+            if (colon < 0) return new HostPort(t,22);
+            String h = t.substring(0, colon);
+            int p = Integer.parseInt(t.substring(colon+1));
+            return new HostPort(h,p);
         }
     }
 
@@ -216,7 +445,7 @@ public class PortTunnelOpenSSH {
     // =========================================================================================
     private static void generateKeyIfNeeded(String sshKeygenPath, Map<String,Object> keygen, Logger log)
             throws IOException, InterruptedException {
-        String identityFile = optStr(keygen,"identityFile", null);
+        String identityFile = expandPath(optStr(keygen,"identityFile", null));
         boolean overwrite = optBool(keygen,"overwriteIfExists", false);
         String type = optStr(keygen,"type","ed25519").toLowerCase(Locale.ROOT);
         int bits = optInt(keygen,"bits", 4096);
@@ -232,15 +461,22 @@ public class PortTunnelOpenSSH {
             return;
         }
 
-        Files.createDirectories(priv.getParent()); // создаём каталог, если его ещё нет
+        Path parent = priv.getParent();
+        if (parent != null) {
+            try {
+                Files.createDirectories(parent);
+            } catch (FileAlreadyExistsException fae) {
+                if (!Files.isDirectory(parent)) throw new IOException("Parent exists but is not a directory: " + parent);
+            }
+        }
 
         List<String> cmd = new ArrayList<>();
         cmd.add(sshKeygenPath);
         cmd.add("-t"); cmd.add(type.equals("rsa") ? "rsa" : "ed25519");
-        if ("rsa".equals(type)) { cmd.add("-b"); cmd.add(String.valueOf(bits)); } // для RSA задаём битность
-        cmd.add("-C"); cmd.add(comment == null ? "" : comment);                   // комментарий в ключе
-        cmd.add("-f"); cmd.add(identityFile);                                     // файл приватного ключа
-        cmd.add("-N"); cmd.add(passphrase == null ? "" : passphrase);             // passphrase (пустая строка = без пароля)
+        if ("rsa".equals(type)) { cmd.add("-b"); cmd.add(String.valueOf(bits)); }
+        cmd.add("-C"); cmd.add(comment == null ? "" : comment);
+        cmd.add("-f"); cmd.add(identityFile);
+        cmd.add("-N"); cmd.add(passphrase == null ? "" : passphrase);
 
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.redirectErrorStream(true);
@@ -266,7 +502,7 @@ public class PortTunnelOpenSSH {
     }
 
     // =========================================================================================
-    // OpenSSH runner: генерирует ssh_config, запускает ssh.exe, ждёт поднятия портов, выводит JSON
+    // OpenSSH runner
     // =========================================================================================
     private static final class OpenSshRunner {
         private final String sshPath, host, user, knownHosts;
@@ -277,8 +513,8 @@ public class PortTunnelOpenSSH {
         private final List<Forward> forwards;
         private final Logger log;
 
-        private final boolean printJson;  // печатать JSON в stdout
-        private final String jsonPath;    // и/или писать в файл
+        private final boolean printJson;
+        private final String jsonPath;
         private boolean jsonEmitted = false;
 
         private Process proc;
@@ -294,13 +530,11 @@ public class PortTunnelOpenSSH {
             this.printJson = printJson; this.jsonPath = jsonPath;
         }
 
-        // Запускает ssh.exe с временным ssh_config. Никаких интерактивных запросов (BatchMode yes).
         void start() throws Exception {
-            cleanup(); // на случай повтора
+            cleanup();
             tempDir = Files.createTempDirectory("ptw-ssh-");
             sshConfig = tempDir.resolve("ssh_config");
 
-            // Формируем минимальный, но достаточный ssh_config
             List<String> cfg = new ArrayList<>();
             cfg.add("Host target");
             cfg.add("  HostName " + host);
@@ -308,48 +542,39 @@ public class PortTunnelOpenSSH {
             cfg.add("  User " + user);
             cfg.add("  ServerAliveInterval " + keepAlive);
             cfg.add("  TCPKeepAlive yes");
-            cfg.add("  ExitOnForwardFailure yes"); // упасть, если форвард не удалось поднять
-            cfg.add("  BatchMode yes");            // не задавать вопросов в консоли
+            cfg.add("  ExitOnForwardFailure yes");
+            cfg.add("  BatchMode yes"); // основной режим — без интерактива
 
             if (identityFile != null && !identityFile.isBlank())
                 cfg.add("  IdentityFile " + identityFile.replace("\\","\\\\"));
 
-            // Добавим ProxyJump (если включён)
             cfg.addAll(proxy.toConfigLines());
 
-            // Изоляция или строгая проверка known_hosts
             if (strict) {
                 if (knownHosts != null && !knownHosts.isBlank())
                     cfg.add("  UserKnownHostsFile " + knownHosts.replace("\\","\\\\"));
             } else {
                 cfg.add("  StrictHostKeyChecking no");
-                cfg.add("  UserKnownHostsFile NUL"); // Windows-эквивалент /dev/null
+                cfg.add("  UserKnownHostsFile NUL");
             }
-
-            // Локальные форварды
             for (Forward f : forwards) {
                 cfg.add(String.format("  LocalForward %s:%d %s:%d", f.lba, f.lp, f.rh, f.rp));
             }
+            Files.writeString(sshConfig, String.join(System.lineSeparator(), cfg)+System.lineSeparator(), StandardCharsets.UTF_8);
 
-            Files.writeString(sshConfig,
-                    String.join(System.lineSeparator(), cfg)+System.lineSeparator(),
-                    StandardCharsets.UTF_8);
-
-            // Команда запуска ssh (используем alias "target" из ssh_config)
             List<String> cmd = new ArrayList<>();
             cmd.add(sshPath);
             cmd.add("-F"); cmd.add(sshConfig.toString());
-            cmd.add("-N");                    // не запускать удалённую команду (только туннели)
+            cmd.add("-N");
             cmd.add("target");
 
             ProcessBuilder pb = new ProcessBuilder(cmd);
-            pb.redirectErrorStream(true);     // stdout+stderr в один поток
+            pb.redirectErrorStream(true);
             proc = pb.start();
             jsonEmitted = false;
             log.debug("Started OpenSSH: " + cmd);
         }
 
-        // Ждём, пока все локальные порты станут доступными для подключения.
         void waitUp(Duration timeout) throws Exception {
             long deadline = System.nanoTime() + (timeout==null?Duration.ofSeconds(10):timeout).toNanos();
             try (BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
@@ -363,7 +588,6 @@ public class PortTunnelOpenSSH {
                         if (!canConnect(f.lba, f.lp, 200)) { all = false; break; }
                     }
                     if (all) { log.info("All forwards are up."); return; }
-                    // Очищаем буфер вывода, чтобы процесс не блокировался при многословном ssh -v
                     while (br.ready()) br.readLine();
                     Thread.sleep(150);
                 }
@@ -371,7 +595,6 @@ public class PortTunnelOpenSSH {
             throw new IOException("Timeout waiting for local forwards.");
         }
 
-        // Печатает JSON с "итоговой картой" форвардов (однократно после подъёма).
         void emitJsonOnce() {
             if (jsonEmitted) return;
             jsonEmitted = true;
@@ -406,13 +629,11 @@ public class PortTunnelOpenSSH {
             }
         }
 
-        // Ожидаем завершение ssh.exe (обычно происходит по Ctrl+C), параллельно читаем вывод.
         void waitForExit() throws IOException, InterruptedException {
             pump(proc.getInputStream(), log);
             proc.waitFor();
         }
 
-        // Остановка и зачистка временных файлов.
         void stop() {
             if (proc != null) proc.destroy();
             cleanup();
@@ -430,32 +651,22 @@ public class PortTunnelOpenSSH {
     }
 
     // =========================================================================================
-    // ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (сеть, JSON, логирование, retry и т.п.)
+    // ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
     // =========================================================================================
 
-    // Описание одного форварда (локально → удалённо).
-    private static final class Forward {
-        final String lba;  // local bind address (например, 127.0.0.1)
-        final int lp;      // local port (0 → выбрать свободный)
-        final String rh;   // remote host (с точки зрения удалённого SSH-сервера)
-        final int rp;      // remote port (сервис на удалёнке)
-
+    private static final class Forward { final String lba; final int lp; final String rh; final int rp;
         Forward(String lba,int lp,String rh,int rp){this.lba=lba;this.lp=lp;this.rh=rh;this.rp=rp;}
-        public String toString(){ return lba+":"+lp+" -> "+rh+":"+rp; }
-    }
+        public String toString(){ return lba+":"+lp+" -> "+rh+":"+rp; } }
 
-    // Проверить, что к локальному порту можно подключиться.
     private static boolean canConnect(String host, int port, int timeoutMs) {
         try (Socket s = new Socket()) { s.connect(new InetSocketAddress(host, port), timeoutMs); return true; }
         catch (IOException e) { return false; }
     }
 
-    // Подобрать свободный локальный порт, привязанный к указанному адресу.
     private static int findFreePort(String bindAddr) throws IOException {
         try (ServerSocket ss = new ServerSocket()) { ss.bind(new InetSocketAddress(bindAddr,0)); return ss.getLocalPort(); }
     }
 
-    // Асинхронно «откачиваем» вывод процесса, чтобы не зависал на переполнении буфера.
     private static void pump(InputStream is, Logger log) {
         new Thread(() -> {
             try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
@@ -464,7 +675,6 @@ public class PortTunnelOpenSSH {
         }, "ssh-out").start();
     }
 
-    // Утилиты чтения stdout/stderr процесса.
     private static String readAll(InputStream is) {
         try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
             StringBuilder sb=new StringBuilder(); String ln; while((ln=br.readLine())!=null) sb.append(ln).append('\n'); return sb.toString();
@@ -518,7 +728,7 @@ public class PortTunnelOpenSSH {
         return r.toString();
     }
 
-    // Параметры авто‑перезапуска (retry with backoff).
+    // Параметры авто-перезапуска (retry with backoff).
     private static final class RetryPolicy {
         final boolean enabled; final long initialDelayMs, maxDelayMs; final double multiplier;
         RetryPolicy(boolean e,long i,long m,double k){enabled=e;initialDelayMs=i;maxDelayMs=m;multiplier=k;}
@@ -532,7 +742,7 @@ public class PortTunnelOpenSSH {
         }
     }
 
-    // ===== ЛЁГКИЙ JSON‑ПАРСЕР (объекты/массивы/строки/числа/bool/null). Без зависимостей. =====
+    // ===== ЛЁГКИЙ JSON-ПАРСЕР (объекты/массивы/строки/числа/bool/null). Без зависимостей. =====
     private static Map<String,Object> readJsonFile(Path p) throws IOException {
         String s = Files.readString(p, StandardCharsets.UTF_8);
         return asObj(parseJson(s));
@@ -579,7 +789,8 @@ public class PortTunnelOpenSSH {
             while(i<n){ char c=peek();
                 if(c>='0'&&c<='9'){ next(); continue; }
                 if(c=='.'){ dot=true; next(); continue; }
-                if(c=='e'||c=='E'){ exp=true; next(); if(peek()=='+'||peek()=='-') next(); continue; } break; }
+                if(c=='e'||c=='E'){ exp=true; next(); if(peek()=='+'||pe
+                -'-') next(); continue; } break; }
             String t=s.substring(st,i);
             try { if(dot||exp) return Double.parseDouble(t); long v=Long.parseLong(t); return (v>=Integer.MIN_VALUE&&v<=Integer.MAX_VALUE)?(int)v:v; }
             catch(Exception e){ throw err("bad number: "+t); } }
@@ -590,7 +801,7 @@ public class PortTunnelOpenSSH {
         RuntimeException err(String m){ return new RuntimeException(m+" at pos "+i); }
     }
 
-    // Простой логгер с уровнями (silent/error/info/debug)
+    // Простой логгер
     private static final class Logger {
         enum L { SILENT, ERROR, INFO, DEBUG }
         final L level;
@@ -609,5 +820,26 @@ public class PortTunnelOpenSSH {
 
     private static String stackTrace(Throwable t){
         StringWriter sw=new StringWriter(); t.printStackTrace(new PrintWriter(sw)); return sw.toString();
+    }
+
+    // ===== НОВОЕ: расширение путей (~, %VAR%) =====
+    private static String expandPath(String p) {
+        if (p == null) return null;
+        String r = p;
+
+        // ~ → user.home
+        String home = System.getProperty("user.home");
+        if (r.equals("~")) r = home;
+        else if (r.startsWith("~" + File.separator)) {
+            r = home + r.substring(1);
+        }
+
+        // %VAR% → значение из env (Windows-стиль)
+        // (простая замена, без рекурсии)
+        for (Map.Entry<String, String> e : System.getenv().entrySet()) {
+            String k = "%" + e.getKey() + "%";
+            if (r.contains(k)) r = r.replace(k, e.getValue());
+        }
+        return r;
     }
 }
