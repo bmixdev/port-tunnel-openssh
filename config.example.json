@@ -1,0 +1,46 @@
+{
+  "sshHost": "serverA.example.org",
+  "sshPort": 22,
+  "sshUser": "astrauser",
+  "opensshPath": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
+  "sshKeygenPath": "C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe",
+  "sshAddPath": "C:\\Windows\\System32\\OpenSSH\\ssh-add.exe",
+  "strictHostKeyChecking": true,
+  "userKnownHostsFile": null,
+  "keepaliveSec": 60,
+  "proxyJump": {
+    "enabled": false
+  },
+  "keygen": {
+    "enabled": true,
+    "identityFile": "C:\\Users\\me\\.ssh\\id_ed25519",
+    "type": "ed25519",
+    "bits": 4096,
+    "comment": "astrauser@myhost",
+    "passphrase": null,
+    "overwriteIfExists": false,
+    "addToAgent": true
+  },
+  "auth": {
+    "method": "key"
+  },
+  "forwards": [
+    {
+      "localBindAddr": "127.0.0.1",
+      "localPort": 0,
+      "remoteHost": "127.0.0.1",
+      "remotePort": 65482
+    }
+  ],
+  "output": {
+    "printJson": true,
+    "jsonPath": "C:\\temp\\forwards.json"
+  },
+  "retry": {
+    "enabled": true,
+    "initialDelayMs": 1000,
+    "maxDelayMs": 30000,
+    "multiplier": 2.0
+  },
+  "logLevel": "info"
+}

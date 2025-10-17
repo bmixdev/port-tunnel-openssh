@@ -1,0 +1,14 @@
+target/
+*.class
+*.jar
+*.log
+*.iml
+.idea/
+.project
+.classpath
+.settings/
+bin/
+.DS_Store
+Thumbs.db
+config.json
+*.keystore
