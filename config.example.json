@@ -5,7 +5,7 @@
   "opensshPath": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
   "sshKeygenPath": "C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe",
   "sshAddPath": "C:\\Windows\\System32\\OpenSSH\\ssh-add.exe",
-  "strictHostKeyChecking": true,
+  "strictHostKeyChecking": false,
   "userKnownHostsFile": null,
   "keepaliveSec": 60,
   "proxyJump": {
